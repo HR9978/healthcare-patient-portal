@@ -1,0 +1,243 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────── Enums ─────────────
+
+enum Role {
+  PATIENT
+  DOCTOR
+  ADMIN
+}
+
+enum AppointmentStatus {
+  PENDING
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum InvoiceStatus {
+  DRAFT
+  PENDING
+  PAID
+  REFUNDED
+  FAILED
+}
+
+// ───────────── Users & Auth ─────────────
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  role         Role
+  firstName    String
+  lastName     String
+  phone        String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  patient       Patient?
+  doctor        Doctor?
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]
+
+  @@index([role])
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ───────────── Profiles ─────────────
+
+model Patient {
+  id               String    @id @default(uuid())
+  userId           String    @unique
+  dateOfBirth      DateTime?
+  gender           String?
+  address          String?
+  emergencyContact String?
+  insuranceNumber  String?
+
+  user          User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  appointments  Appointment[]
+  medicalRecords MedicalRecord[]
+  prescriptions Prescription[]
+  invoices      Invoice[]
+}
+
+model Specialty {
+  id      String   @id @default(uuid())
+  name    String   @unique
+  doctors Doctor[]
+}
+
+model Doctor {
+  id              String  @id @default(uuid())
+  userId          String  @unique
+  specialtyId     String
+  licenseNumber   String  @unique
+  bio             String?
+  yearsExperience Int     @default(0)
+  consultationFee Decimal @default(0) @db.Decimal(10, 2)
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  specialty      Specialty       @relation(fields: [specialtyId], references: [id])
+  schedules      Schedule[]
+  appointments   Appointment[]
+  medicalRecords MedicalRecord[]
+  prescriptions  Prescription[]
+
+  @@index([specialtyId])
+}
+
+model Room {
+  id           String        @id @default(uuid())
+  name         String        @unique
+  floor        String?
+  isActive     Boolean       @default(true)
+  schedules    Schedule[]
+  appointments Appointment[]
+}
+
+// ───────────── Scheduling ─────────────
+
+// Weekly recurring availability. Slots are generated from this at query time.
+model Schedule {
+  id          String  @id @default(uuid())
+  doctorId    String
+  roomId      String?
+  dayOfWeek   Int // 0 = Sunday ... 6 = Saturday
+  startTime   String // "09:00"
+  endTime     String // "17:00"
+  slotMinutes Int     @default(30)
+  isActive    Boolean @default(true)
+
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  room   Room?  @relation(fields: [roomId], references: [id])
+
+  @@index([doctorId, dayOfWeek])
+}
+
+model Appointment {
+  id        String            @id @default(uuid())
+  doctorId  String
+  patientId String
+  roomId    String?
+  startsAt  DateTime
+  endsAt    DateTime
+  status    AppointmentStatus @default(PENDING)
+  reason    String?
+  notes     String?
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  doctor        Doctor         @relation(fields: [doctorId], references: [id])
+  patient       Patient        @relation(fields: [patientId], references: [id])
+  room          Room?          @relation(fields: [roomId], references: [id])
+  invoice       Invoice?
+  medicalRecord MedicalRecord?
+
+  // NOTE: the double-booking guard is a PARTIAL unique index created in a raw SQL
+  // migration, so cancelled slots can be re-booked:
+  //   CREATE UNIQUE INDEX appointment_doctor_slot_unique
+  //   ON "Appointment" ("doctorId", "startsAt")
+  //   WHERE status NOT IN ('CANCELLED', 'NO_SHOW');
+  @@index([doctorId, startsAt])
+  @@index([patientId])
+}
+
+// ───────────── Clinical ─────────────
+
+model MedicalRecord {
+  id            String   @id @default(uuid())
+  patientId     String
+  doctorId      String
+  appointmentId String?  @unique
+  diagnosis     String
+  symptoms      String?
+  treatment     String?
+  notes         String?
+  createdAt     DateTime @default(now())
+
+  patient       Patient        @relation(fields: [patientId], references: [id])
+  doctor        Doctor         @relation(fields: [doctorId], references: [id])
+  appointment   Appointment?   @relation(fields: [appointmentId], references: [id])
+  prescriptions Prescription[]
+
+  @@index([patientId])
+}
+
+model Prescription {
+  id              String         @id @default(uuid())
+  patientId       String
+  doctorId        String
+  medicalRecordId String?
+  medication      String
+  dosage          String
+  frequency       String
+  durationDays    Int
+  instructions    String?
+  issuedAt        DateTime       @default(now())
+
+  patient       Patient        @relation(fields: [patientId], references: [id])
+  doctor        Doctor         @relation(fields: [doctorId], references: [id])
+  medicalRecord MedicalRecord? @relation(fields: [medicalRecordId], references: [id])
+
+  @@index([patientId])
+}
+
+// ───────────── Billing ─────────────
+
+model Invoice {
+  id            String        @id @default(uuid())
+  patientId     String
+  appointmentId String?       @unique
+  amount        Decimal       @db.Decimal(10, 2)
+  status        InvoiceStatus @default(PENDING)
+  paymentMethod String? // mock payment for the portfolio demo
+  paidAt        DateTime?
+  createdAt     DateTime      @default(now())
+
+  patient     Patient      @relation(fields: [patientId], references: [id])
+  appointment Appointment? @relation(fields: [appointmentId], references: [id])
+
+  @@index([patientId])
+}
+
+// ───────────── Audit ─────────────
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?
+  action     String // e.g. "LOGIN", "APPOINTMENT_CREATED", "RECORD_VIEWED"
+  entity     String?
+  entityId   String?
+  ipAddress  String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([entity, entityId])
+  @@index([createdAt])
+}
