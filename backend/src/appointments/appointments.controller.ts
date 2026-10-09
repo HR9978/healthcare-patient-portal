@@ -2,6 +2,8 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
+  HttpStatus,
   Param,
   ParseUUIDPipe,
   Patch,
@@ -16,6 +18,7 @@ import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
 import { AppointmentsService } from './appointments.service';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
+import { PayAppointmentDto } from './dto/pay-appointment.dto';
 
 @ApiTags('appointments')
 @ApiBearerAuth()
@@ -31,6 +34,18 @@ export class AppointmentsController {
     @Req() req: Request,
   ) {
     return this.appointments.create(user, dto, req.ip);
+  }
+
+  @Roles(Role.PATIENT)
+  @HttpCode(HttpStatus.OK)
+  @Post(':id/pay')
+  pay(
+    @CurrentUser() user: AuthUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: PayAppointmentDto,
+    @Req() req: Request,
+  ) {
+    return this.appointments.pay(user, id, dto, req.ip);
   }
 
   @Get()

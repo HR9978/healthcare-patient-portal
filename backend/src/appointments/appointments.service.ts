@@ -21,6 +21,7 @@ import {
 } from '../doctors/slots.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
+import { PayAppointmentDto } from './dto/pay-appointment.dto';
 
 const appointmentInclude = {
   doctor: {
@@ -160,6 +161,63 @@ export class AppointmentsService {
     }
   }
 
+  /**
+   * Mock payment. No card data is ever received; this only simulates a successful
+   * charge: the invoice becomes PAID and the appointment CONFIRMED, atomically.
+   */
+  async pay(user: AuthUser, id: string, dto: PayAppointmentDto, ip?: string) {
+    const appointment = await this.prisma.appointment.findUnique({
+      where: { id },
+      include: { patient: { select: { userId: true } }, invoice: true },
+    });
+    if (!appointment || appointment.patient.userId !== user.id) {
+      throw new NotFoundException('Appointment not found');
+    }
+    if (
+      appointment.status !== AppointmentStatus.PENDING ||
+      !appointment.invoice ||
+      appointment.invoice.status !== InvoiceStatus.PENDING
+    ) {
+      throw new BadRequestException('This appointment is not awaiting payment');
+    }
+    if (appointment.startsAt <= new Date()) {
+      throw new BadRequestException('This appointment time has already passed');
+    }
+
+    const invoiceId = appointment.invoice.id;
+    await this.prisma.$transaction(async (tx) => {
+      // Conditional update: a double-click or retry cannot pay twice.
+      const confirmed = await tx.appointment.updateMany({
+        where: { id, status: AppointmentStatus.PENDING },
+        data: { status: AppointmentStatus.CONFIRMED },
+      });
+      if (confirmed.count === 0) {
+        throw new ConflictException('This appointment was already processed');
+      }
+      await tx.invoice.update({
+        where: { id: invoiceId },
+        data: {
+          status: InvoiceStatus.PAID,
+          paymentMethod: dto.method,
+          paidAt: new Date(),
+        },
+      });
+    });
+
+    await this.audit.log({
+      userId: user.id,
+      action: 'PAYMENT_RECEIVED',
+      entity: 'Appointment',
+      entityId: id,
+      ip,
+      metadata: { method: dto.method },
+    });
+    return this.prisma.appointment.findUniqueOrThrow({
+      where: { id },
+      include: appointmentInclude,
+    });
+  }
+
   /** Patients see their own, doctors see theirs, admins see everything. */
   findAllForUser(user: AuthUser) {
     const where: Prisma.AppointmentWhereInput =
@@ -203,10 +261,21 @@ export class AppointmentsService {
       throw new BadRequestException('Past appointments cannot be cancelled');
     }
 
-    const updated = await this.prisma.appointment.update({
-      where: { id },
-      data: { status: AppointmentStatus.CANCELLED },
-      include: appointmentInclude,
+    const updated = await this.prisma.$transaction(async (tx) => {
+      // Settle the invoice together with the cancellation.
+      await tx.invoice.updateMany({
+        where: { appointmentId: id, status: InvoiceStatus.PENDING },
+        data: { status: InvoiceStatus.FAILED },
+      });
+      await tx.invoice.updateMany({
+        where: { appointmentId: id, status: InvoiceStatus.PAID },
+        data: { status: InvoiceStatus.REFUNDED },
+      });
+      return tx.appointment.update({
+        where: { id },
+        data: { status: AppointmentStatus.CANCELLED },
+        include: appointmentInclude,
+      });
     });
 
     await this.audit.log({
